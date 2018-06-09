@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/kubernetes-sigs/poseidon/test/e2e/framework"
@@ -32,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"time"
 )
 
 var _ = Describe("Poseidon", func() {
@@ -483,6 +484,74 @@ var _ = Describe("Poseidon", func() {
 			Expect(err).To(HaveOccurred())
 		})
 
+		//
+		It("validates MaxPods limit number of pods that are allowed to run [Slow]", func() {
+
+			nodeList, err := clientset.CoreV1().Nodes().List(metav1.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			for idx, node := range nodeList.Items {
+				framework.Logf("Node: %v", node)
+				podAlloc, found := node.Status.Allocatable[v1.ResourcePods]
+				Expect(found).To(Equal(true))
+				podList, err := clientset.CoreV1().Pods(metav1.NamespaceAll).List(metav1.ListOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				podCount := podList.Size()
+
+				name := "max-pods-" + strconv.Itoa(idx)
+				var replicas int32
+				replicas = int32(podAlloc.Value())
+				if podCount < 1 {
+					replicas += 5
+				}
+				deployment, err := clientset.ExtensionsV1beta1().Deployments(ns).Create(&v1beta1.Deployment{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "busybox"},
+						Name:   name,
+					},
+					Spec: v1beta1.DeploymentSpec{
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"app": "busybox", "name": "test-max-pods"},
+						},
+						Replicas: &replicas,
+						Template: v1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Labels: map[string]string{"name": "test-max-pods", "app": "busybox", "schedulerName": "poseidon"},
+								Name:   name,
+							},
+							Spec: v1.PodSpec{
+								SchedulerName: "poseidon",
+								Containers: []v1.Container{
+									{
+										Name:            fmt.Sprintf("container-%s", name),
+										Image:           "busybox:latest",
+										ImagePullPolicy: "IfNotPresent",
+									},
+								},
+							},
+						},
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+				time.Sleep(2 * time.Minute)
+				podList, err = clientset.CoreV1().Pods(metav1.NamespaceAll).List(metav1.ListOptions{})
+				Expect(err).NotTo(HaveOccurred())
+				var podRunningCount, podPendingCount, podFailedCount int64 = 0, 0, 0
+				for _, pod := range podList.Items {
+					if pod.Status.Phase == v1.PodRunning {
+						podRunningCount++
+					} else if pod.Status.Phase == v1.PodPending {
+						podPendingCount++
+					} else if pod.Status.Phase == v1.PodFailed {
+						podFailedCount++
+					}
+				}
+				Expect(podRunningCount == podAlloc.Value()).To(Equal(true))
+				glog.Errorf("Pods: %d Running, %d Pening, %d Failed, %d total", podRunningCount, podPendingCount, podFailedCount, podList.Size())
+
+				framework.Logf("Time to clean up the deployment [%s] now...", deployment)
+				f.DeleteDeploymentIfExist(ns, deployment.Name)
+			}
+		})
 		// Test Nodes does not have any label, hence it should be impossible to schedule Pod with
 		// nonempty Selector set.
 		/*
